@@ -1,14 +1,17 @@
 mod link_controller;
+mod midi_clock;
 mod tap_tempo;
 mod x1_controller;
 
 use std::{
+    env,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
 use link_controller::LinkController;
+use midi_clock::MidiClock;
 use tap_tempo::TapTempo;
 use x1_controller::{
     ButtonEvent, ButtonEventKind, ButtonId, Timestamp, X1Controller, LED_BRIGHT, LED_DIM,
@@ -32,6 +35,7 @@ enum ControlMessage {
 
 fn main() -> rusb::Result<()> {
     let mut controller = X1Controller::connect()?;
+    let midi_port_hint = env::args().nth(1).unwrap_or_default();
 
     // Ensure the tap LED starts dimmed.
     controller.set_led_raw(TAP_LED_INDEX, LED_DIM);
@@ -42,6 +46,25 @@ fn main() -> rusb::Result<()> {
             let _ = tx.send(ControlMessage::Button { event, timestamp });
         }
     });
+
+    let midi_clock = match MidiClock::new(&midi_port_hint, START_BPM) {
+        Ok(clock) => {
+            println!("MIDI clock connected to {}", clock.port_name());
+            Some(clock)
+        }
+        Err(err) => {
+            if midi_port_hint.is_empty() {
+                eprintln!(
+                    "Warning: unable to open MIDI clock output; continuing without MIDI clock ({err})"
+                );
+            } else {
+                eprintln!(
+                    "Warning: unable to open MIDI clock output for hint '{midi_port_hint}'; continuing without MIDI clock ({err})"
+                );
+            }
+            None
+        }
+    };
 
     let mut link = LinkController::new(START_BPM);
     let mut tapper = TapTempo::new(4, 2.0);
@@ -69,6 +92,7 @@ fn main() -> rusb::Result<()> {
                         &mut controller,
                         &mut playing,
                         &mut current_bpm,
+                        &midi_clock,
                         &mut flash_until,
                         &mut current_led_value,
                     );
@@ -98,6 +122,7 @@ fn handle_button_event(
     controller: &mut X1Controller,
     playing: &mut bool,
     current_bpm: &mut Option<f64>,
+    midi_clock: &Option<MidiClock>,
     flash_until: &mut Option<Instant>,
     current_led_value: &mut u8,
 ) {
@@ -110,8 +135,14 @@ fn handle_button_event(
 
             if let Some(bpm) = tapper.add_tap(tap_time) {
                 link.set_tempo(bpm);
+                if let Some(clock) = midi_clock.as_ref() {
+                    let _ = clock.set_bpm(bpm);
+                }
                 if !*playing {
                     link.set_playing(true);
+                    if let Some(clock) = midi_clock.as_ref() {
+                        let _ = clock.start();
+                    }
                     *playing = true;
                     println!("Clock START @ {:.2} BPM", bpm);
                 } else {
@@ -131,11 +162,19 @@ fn handle_button_event(
             *playing = !*playing;
             link.set_playing(*playing);
             if *playing {
+                if let Some(clock) = midi_clock.as_ref() {
+                    let target_bpm = current_bpm.unwrap_or(START_BPM);
+                    let _ = clock.set_bpm(target_bpm);
+                    let _ = clock.start();
+                }
                 println!("Clock START @ {:.2} BPM", current_bpm.unwrap_or(START_BPM));
                 *flash_until = Some(Instant::now() + Duration::from_millis(FLASH_DURATION_MS));
                 controller.set_led_raw(TAP_LED_INDEX, LED_BRIGHT);
                 *current_led_value = LED_BRIGHT;
             } else {
+                if let Some(clock) = midi_clock.as_ref() {
+                    let _ = clock.stop();
+                }
                 println!("Clock STOP");
                 *flash_until = None;
                 controller.set_led_raw(TAP_LED_INDEX, LED_DIM);
